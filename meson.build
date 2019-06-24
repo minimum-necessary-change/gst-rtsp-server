@@ -1,6 +1,6 @@
 project('gst-rtsp-server', 'c',
-  version : '1.15.2.1',
-  meson_version : '>= 0.47',
+  version : '1.17.0.1',
+  meson_version : '>= 0.48',
   default_options : ['warning_level=1', 'buildtype=debugoptimized'])
 
 gst_version = meson.project_version()
@@ -15,7 +15,7 @@ else
 endif
 gst_version_is_dev = gst_version_minor % 2 == 1 and gst_version_micro < 90
 
-glib_req = '>= 2.40.0'
+glib_req = '>= 2.44.0'
 gst_req = '>= @0@.@1@.0'.format(gst_version_major, gst_version_minor)
 
 api_version = '1.0'
@@ -187,6 +187,7 @@ if get_option('default_library') == 'shared'
   plugins_pkgconfig_install_dir = disabler()
 endif
 
+plugins = []
 subdir('gst')
 if not get_option('tests').disabled()
   subdir('tests')
@@ -195,3 +196,4 @@ if not get_option('examples').disabled()
   subdir('examples')
 endif
 subdir('pkgconfig')
+subdir('docs')

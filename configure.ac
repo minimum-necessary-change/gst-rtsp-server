@@ -2,7 +2,7 @@ AC_PREREQ(2.69)
 dnl initialize autoconf
 dnl when going to/from release please set the nano (fourth number) right !
 dnl releases only do Wall, cvs and prerelease does Werror too
-AC_INIT([GStreamer RTSP Server Library], [1.15.2.1],
+AC_INIT([GStreamer RTSP Server Library], [1.17.0.1],
     [http://bugzilla.gnome.org/enter_bug.cgi?product=GStreamer],
     [gst-rtsp-server])
 AG_GST_INIT
@@ -53,13 +53,13 @@ dnl      1.2.5 => 205
 dnl      1.10.9 (who knows) => 1009
 dnl
 dnl sets GST_LT_LDFLAGS
-AS_LIBTOOL(GST, 1502, 0, 1502)
+AS_LIBTOOL(GST, 1700, 0, 1700)
 
 dnl *** required versions of GStreamer stuff ***
-GST_REQ=1.15.2.1
-GSTPB_REQ=1.15.2.1
-GSTPG_REQ=1.15.2.1
-GSTPD_REQ=1.15.2.1
+GST_REQ=1.17.0.1
+GSTPB_REQ=1.17.0.1
+GSTPG_REQ=1.17.0.1
+GSTPD_REQ=1.17.0.1
 
 dnl *** autotools stuff ****
 
@@ -131,10 +131,6 @@ AM_CONDITIONAL(HAVE_VALGRIND, test ! "x$VALGRIND_PATH" = "xno")
 dnl check for gobject-introspection
 GOBJECT_INTROSPECTION_CHECK([1.31.1])
 
-dnl check for documentation tools
-AG_GST_DOCBOOK_CHECK
-GTK_DOC_CHECK([1.12])
-
 dnl *** checks for libraries ***
 
 dnl check for pthreads
@@ -153,7 +149,7 @@ dnl *** checks for library functions ***
 dnl *** checks for dependancy libraries ***
 
 dnl GLib is required
-GLIB_REQ=2.40.0
+GLIB_REQ=2.44.0
 AC_SUBST([GLIB_REQ])
 AG_GST_GLIB_CHECK([$GLIB_REQ])
 
@@ -352,9 +348,6 @@ tests/check/Makefile
 pkgconfig/Makefile
 pkgconfig/gstreamer-rtsp-server.pc
 pkgconfig/gstreamer-rtsp-server-uninstalled.pc
-docs/Makefile
-docs/version.entities
-docs/libs/Makefile
 ])
 AC_OUTPUT
 

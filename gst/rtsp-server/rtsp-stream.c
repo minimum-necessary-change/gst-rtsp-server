@@ -130,6 +130,9 @@ struct _GstRTSPStreamPrivate
   guint rtx_pt;
   GstClockTime rtx_time;
 
+  /* rate control */
+  gboolean do_rate_control;
+
   /* Forward Error Correction with RFC 5109 */
   GstElement *ulpfec_decoder;
   GstElement *ulpfec_encoder;
@@ -190,6 +193,7 @@ struct _GstRTSPStreamPrivate
                                         GST_RTSP_LOWER_TRANS_TCP
 #define DEFAULT_MAX_MCAST_TTL   255
 #define DEFAULT_BIND_MCAST_ADDRESS FALSE
+#define DEFAULT_DO_RATE_CONTROL TRUE
 
 enum
 {
@@ -291,6 +295,7 @@ gst_rtsp_stream_init (GstRTSPStream * stream)
   priv->publish_clock_mode = GST_RTSP_PUBLISH_CLOCK_MODE_CLOCK;
   priv->max_mcast_ttl = DEFAULT_MAX_MCAST_TTL;
   priv->bind_mcast_address = DEFAULT_BIND_MCAST_ADDRESS;
+  priv->do_rate_control = DEFAULT_DO_RATE_CONTROL;
 
   g_mutex_init (&priv->lock);
 
@@ -2107,6 +2112,7 @@ gst_rtsp_stream_get_buffer_size (GstRTSPStream * stream)
  *
  * Returns: %TRUE if the requested ttl has been set successfully.
  *
+ * Since: 1.16
  */
 gboolean
 gst_rtsp_stream_set_max_mcast_ttl (GstRTSPStream * stream, guint ttl)
@@ -2133,6 +2139,7 @@ gst_rtsp_stream_set_max_mcast_ttl (GstRTSPStream * stream, guint ttl)
  *
  * Returns: the maximum time-to-live value of outgoing multicast packets.
  *
+ * Since: 1.16
  */
 guint
 gst_rtsp_stream_get_max_mcast_ttl (GstRTSPStream * stream)
@@ -2155,6 +2162,7 @@ gst_rtsp_stream_get_max_mcast_ttl (GstRTSPStream * stream)
  *
  * Returns: TRUE if the requested ttl value is allowed.
  *
+ * Since: 1.16
  */
 gboolean
 gst_rtsp_stream_verify_mcast_ttl (GstRTSPStream * stream, guint ttl)
@@ -2176,6 +2184,8 @@ gst_rtsp_stream_verify_mcast_ttl (GstRTSPStream * stream, guint ttl)
  *
  * Decide whether the multicast socket should be bound to a multicast address or
  * INADDR_ANY.
+ *
+ * Since: 1.16
  */
 void
 gst_rtsp_stream_set_bind_mcast_address (GstRTSPStream * stream,
@@ -2195,6 +2205,8 @@ gst_rtsp_stream_set_bind_mcast_address (GstRTSPStream * stream,
  * Check if multicast sockets are configured to be bound to multicast addresses.
  *
  * Returns: %TRUE if multicast sockets are configured to be bound to multicast addresses.
+ *
+ * Since: 1.16
  */
 gboolean
 gst_rtsp_stream_is_bind_mcast_address (GstRTSPStream * stream)
@@ -3371,6 +3383,11 @@ create_sender_part (GstRTSPStream * stream, const GstRTSPTransport * transport)
     return FALSE;
   }
 
+  if (g_object_class_find_property (G_OBJECT_GET_CLASS (priv->payloader),
+          "onvif-no-rate-control"))
+    g_object_set (priv->payloader, "onvif-no-rate-control",
+        !priv->do_rate_control, NULL);
+
   for (i = 0; i < 2; i++) {
     gboolean link_tee = FALSE;
     /* For the sender we create this bit of pipeline for both
@@ -3428,6 +3445,9 @@ create_sender_part (GstRTSPStream * stream, const GstRTSPTransport * transport)
       priv->appsink[i] = gst_element_factory_make ("appsink", NULL);
       g_object_set (priv->appsink[i], "emit-signals", FALSE, "buffer-list",
           TRUE, "max-buffers", 1, NULL);
+
+      if (i == 0)
+        g_object_set (priv->appsink[i], "sync", priv->do_rate_control, NULL);
 
       /* we need to set sync and preroll to FALSE for the sink to avoid
        * deadlock. This is only needed for sink sending RTCP data. */
@@ -3758,6 +3778,9 @@ gst_rtsp_stream_join_bin (GstRTSPStream * stream, GstBin * bin,
   g_signal_connect (priv->session, "on-sender-ssrc-active",
       (GCallback) on_sender_ssrc_active, stream);
 
+  g_object_set (priv->session, "disable-sr-timestamp", !priv->do_rate_control,
+      NULL);
+
   if (priv->srcpad) {
     /* be notified of caps changes */
     priv->caps_sig = g_signal_connect (priv->send_src[0], "notify::caps",
@@ -3835,6 +3858,16 @@ gst_rtsp_stream_leave_bin (GstRTSPStream * stream, GstBin * bin,
   /* all transports must be removed by now */
   if (priv->transports != NULL)
     goto transports_not_removed;
+
+  if (priv->send_pool) {
+    GThreadPool *slask;
+
+    slask = priv->send_pool;
+    priv->send_pool = NULL;
+    g_mutex_unlock (&priv->lock);
+    g_thread_pool_free (slask, TRUE, TRUE);
+    g_mutex_lock (&priv->lock);
+  }
 
   clear_tr_cache (priv, TRUE);
   clear_tr_cache (priv, FALSE);
@@ -4108,6 +4141,70 @@ no_stats:
     g_mutex_unlock (&priv->lock);
     return FALSE;
   }
+}
+
+/**
+ * gst_rtsp_stream_get_rates:
+ * @stream: a #GstRTSPStream
+ * @rate: (allow-none): the configured rate
+ * @applied_rate: (allow-none): the configured applied_rate
+ *
+ * Retrieve the current rate and/or applied_rate.
+ *
+ * Returns: %TRUE if rate and/or applied_rate could be determined.
+ * Since: 1.18
+ */
+gboolean
+gst_rtsp_stream_get_rates (GstRTSPStream * stream, gdouble * rate,
+    gdouble * applied_rate)
+{
+  GstRTSPStreamPrivate *priv;
+  GstEvent *event;
+  const GstSegment *segment;
+
+  g_return_val_if_fail (GST_IS_RTSP_STREAM (stream), FALSE);
+
+  if (!rate && !applied_rate) {
+    GST_WARNING_OBJECT (stream, "rate and applied_rate are both NULL");
+    return FALSE;
+  }
+
+  priv = stream->priv;
+
+  g_mutex_lock (&priv->lock);
+
+  if (!priv->send_rtp_sink)
+    goto no_rtp_sink_pad;
+
+  event = gst_pad_get_sticky_event (priv->send_rtp_sink, GST_EVENT_SEGMENT, 0);
+  if (!event)
+    goto no_sticky_event;
+
+  gst_event_parse_segment (event, &segment);
+  if (rate)
+    *rate = segment->rate;
+  if (applied_rate)
+    *applied_rate = segment->applied_rate;
+
+  gst_event_unref (event);
+  g_mutex_unlock (&priv->lock);
+
+  return TRUE;
+
+/* ERRORS */
+no_rtp_sink_pad:
+  {
+    GST_WARNING_OBJECT (stream, "no send_rtp_sink pad yet");
+    g_mutex_unlock (&priv->lock);
+    return FALSE;
+  }
+no_sticky_event:
+  {
+    GST_WARNING_OBJECT (stream, "no segment event on send_rtp_sink pad");
+    g_mutex_unlock (&priv->lock);
+    return FALSE;
+  }
+
 }
 
 /**
@@ -4426,8 +4523,10 @@ on_message_sent (gpointer user_data)
   if (idx != -1) {
     gint dummy;
 
-    GST_DEBUG_OBJECT (stream, "start thread");
-    g_thread_pool_push (priv->send_pool, &dummy, NULL);
+    if (priv->send_pool) {
+      GST_DEBUG_OBJECT (stream, "start thread");
+      g_thread_pool_push (priv->send_pool, &dummy, NULL);
+    }
   }
 
   g_mutex_unlock (&priv->lock);
@@ -4627,6 +4726,7 @@ gst_rtsp_stream_get_rtcp_socket (GstRTSPStream * stream, GSocketFamily family)
  * Get the multicast RTP socket from @stream for a @family.
  *
  * Returns: (transfer full) (nullable): the multicast RTP socket or %NULL if no
+ *
  * socket could be allocated for @family. Unref after usage
  */
 GSocket *
@@ -4662,6 +4762,8 @@ gst_rtsp_stream_get_rtp_multicast_socket (GstRTSPStream * stream,
  *
  * Returns: (transfer full) (nullable): the multicast RTCP socket or %NULL if no
  * socket could be allocated for @family. Unref after usage
+ *
+ * Since: 1.14
  */
 GSocket *
 gst_rtsp_stream_get_rtcp_multicast_socket (GstRTSPStream * stream,
@@ -4700,6 +4802,8 @@ gst_rtsp_stream_get_rtcp_multicast_socket (GstRTSPStream * stream,
  * allocated.
  *
  * Returns: %TRUE if @destination can be addedd and handled by @stream.
+ *
+ * Since: 1.16
  */
 gboolean
 gst_rtsp_stream_add_multicast_client_address (GstRTSPStream * stream,
@@ -4748,6 +4852,8 @@ add_addr_error:
  * Get all multicast client addresses that RTP data will be sent to
  *
  * Returns: A comma separated list of host:port pairs with destinations
+ *
+ * Since: 1.16
  */
 gchar *
 gst_rtsp_stream_get_multicast_client_addresses (GstRTSPStream * stream)
@@ -5009,6 +5115,8 @@ gst_rtsp_stream_set_blocked (GstRTSPStream * stream, gboolean blocked)
  * Unblocks the dataflow on @stream if it is linked.
  *
  * Returns: %TRUE on success
+ *
+ * Since: 1.14
  */
 gboolean
 gst_rtsp_stream_unblock_linked (GstRTSPStream * stream)
@@ -5178,6 +5286,9 @@ gst_rtsp_stream_query_stop (GstRTSPStream * stream, gint64 * stop)
   if (sink) {
     GstQuery *query;
     GstFormat format;
+    gdouble rate;
+    gint64 start_value;
+    gint64 stop_value;
 
     query = gst_query_new_segment (GST_FORMAT_TIME);
     if (!gst_element_query (sink, query)) {
@@ -5186,9 +5297,11 @@ gst_rtsp_stream_query_stop (GstRTSPStream * stream, gint64 * stop)
       gst_object_unref (sink);
       return FALSE;
     }
-    gst_query_parse_segment (query, NULL, &format, NULL, stop);
+    gst_query_parse_segment (query, &rate, &format, &start_value, &stop_value);
     if (format != GST_FORMAT_TIME)
       *stop = -1;
+    else
+      *stop = rate > 0.0 ? stop_value : start_value;
     gst_query_unref (query);
     gst_object_unref (sink);
   } else if (pad) {
@@ -5225,6 +5338,8 @@ gst_rtsp_stream_query_stop (GstRTSPStream * stream, gint64 * stop)
  * Checks whether the individual @stream is seekable.
  *
  * Returns: %TRUE if @stream is seekable, else %FALSE.
+ *
+ * Since: 1.14
  */
 gboolean
 gst_rtsp_stream_seekable (GstRTSPStream * stream)
@@ -5279,6 +5394,8 @@ beach:
  * SETUP.
  *
  * Returns: %TRUE if the stream has been sucessfully updated.
+ *
+ * Since: 1.14
  */
 gboolean
 gst_rtsp_stream_complete_stream (GstRTSPStream * stream,
@@ -5329,6 +5446,8 @@ unallowed_transport:
  * seek operations on it.
  *
  * Returns: %TRUE if the stream contains at least one sink element.
+ *
+ * Since: 1.14
  */
 gboolean
 gst_rtsp_stream_is_complete (GstRTSPStream * stream)
@@ -5353,6 +5472,8 @@ gst_rtsp_stream_is_complete (GstRTSPStream * stream)
  * Checks whether the stream is a sender.
  *
  * Returns: %TRUE if the stream is a sender and %FALSE otherwise.
+ *
+ * Since: 1.14
  */
 gboolean
 gst_rtsp_stream_is_sender (GstRTSPStream * stream)
@@ -5377,6 +5498,8 @@ gst_rtsp_stream_is_sender (GstRTSPStream * stream)
  * Checks whether the stream is a receiver.
  *
  * Returns: %TRUE if the stream is a receiver and %FALSE otherwise.
+ *
+ * Since: 1.14
  */
 gboolean
 gst_rtsp_stream_is_receiver (GstRTSPStream * stream)
@@ -5424,6 +5547,7 @@ mikey_apply_policy (GstCaps * caps, GstMIKEYMessage * msg, guint8 policy)
   /* now override the defaults with what is in the Security Policy */
   if (sp != NULL) {
     guint len;
+    guint enc_alg = GST_MIKEY_ENC_AES_CM_128;
 
     /* collect all the params and go over them */
     len = gst_mikey_payload_sp_get_n_params (sp);
@@ -5433,13 +5557,17 @@ mikey_apply_policy (GstCaps * caps, GstMIKEYMessage * msg, guint8 policy)
 
       switch (param->type) {
         case GST_MIKEY_SP_SRTP_ENC_ALG:
+          enc_alg = param->val[0];
           switch (param->val[0]) {
-            case 0:
+            case GST_MIKEY_ENC_NULL:
               srtp_cipher = "null";
               break;
-            case 2:
-            case 1:
+            case GST_MIKEY_ENC_AES_CM_128:
+            case GST_MIKEY_ENC_AES_KW_128:
               srtp_cipher = "aes-128-icm";
+              break;
+            case GST_MIKEY_ENC_AES_GCM_128:
+              srtp_cipher = "aes-128-gcm";
               break;
             default:
               break;
@@ -5448,10 +5576,20 @@ mikey_apply_policy (GstCaps * caps, GstMIKEYMessage * msg, guint8 policy)
         case GST_MIKEY_SP_SRTP_ENC_KEY_LEN:
           switch (param->val[0]) {
             case AES_128_KEY_LEN:
-              srtp_cipher = "aes-128-icm";
+              if (enc_alg == GST_MIKEY_ENC_AES_CM_128 ||
+                  enc_alg == GST_MIKEY_ENC_AES_KW_128) {
+                srtp_cipher = "aes-128-icm";
+              } else if (enc_alg == GST_MIKEY_ENC_AES_GCM_128) {
+                srtp_cipher = "aes-128-gcm";
+              }
               break;
             case AES_256_KEY_LEN:
-              srtp_cipher = "aes-256-icm";
+              if (enc_alg == GST_MIKEY_ENC_AES_CM_128 ||
+                  enc_alg == GST_MIKEY_ENC_AES_KW_128) {
+                srtp_cipher = "aes-256-icm";
+              } else if (enc_alg == GST_MIKEY_ENC_AES_GCM_128) {
+                srtp_cipher = "aes-256-gcm";
+              }
               break;
             default:
               break;
@@ -5459,11 +5597,10 @@ mikey_apply_policy (GstCaps * caps, GstMIKEYMessage * msg, guint8 policy)
           break;
         case GST_MIKEY_SP_SRTP_AUTH_ALG:
           switch (param->val[0]) {
-            case 0:
+            case GST_MIKEY_MAC_NULL:
               srtp_auth = "null";
               break;
-            case 2:
-            case 1:
+            case GST_MIKEY_MAC_HMAC_SHA_1_160:
               srtp_auth = "hmac-sha1-80";
               break;
             default:
@@ -5797,4 +5934,54 @@ gst_rtsp_stream_get_ulpfec_percentage (GstRTSPStream * stream)
   g_mutex_unlock (&stream->priv->lock);
 
   return res;
+}
+
+/**
+ * gst_rtsp_stream_set_rate_control:
+ *
+ * Define whether @stream will follow the Rate-Control=no behaviour as specified
+ * in the ONVIF replay spec.
+ *
+ * Since: 1.18
+ */
+void
+gst_rtsp_stream_set_rate_control (GstRTSPStream * stream, gboolean enabled)
+{
+  GST_DEBUG_OBJECT (stream, "%s rate control",
+      enabled ? "Enabling" : "Disabling");
+
+  g_mutex_lock (&stream->priv->lock);
+  stream->priv->do_rate_control = enabled;
+  if (stream->priv->appsink[0])
+    g_object_set (stream->priv->appsink[0], "sync", enabled, NULL);
+  if (stream->priv->payloader
+      && g_object_class_find_property (G_OBJECT_GET_CLASS (stream->priv->
+              payloader), "onvif-no-rate-control"))
+    g_object_set (stream->priv->payloader, "onvif-no-rate-control", !enabled,
+        NULL);
+  if (stream->priv->session) {
+    g_object_set (stream->priv->session, "disable-sr-timestamp", !enabled,
+        NULL);
+  }
+  g_mutex_unlock (&stream->priv->lock);
+}
+
+/**
+ * gst_rtsp_stream_get_rate_control:
+ *
+ * Returns: whether @stream will follow the Rate-Control=no behaviour as specified
+ * in the ONVIF replay spec.
+ *
+ * Since: 1.18
+ */
+gboolean
+gst_rtsp_stream_get_rate_control (GstRTSPStream * stream)
+{
+  gboolean ret;
+
+  g_mutex_lock (&stream->priv->lock);
+  ret = stream->priv->do_rate_control;
+  g_mutex_unlock (&stream->priv->lock);
+
+  return ret;
 }

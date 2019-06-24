@@ -50,7 +50,8 @@
  * #GstRTSPSession and #GstRTSPSessionMedia.
  *
  * The state of the media can be controlled with gst_rtsp_media_set_state ().
- * Seeking can be done with gst_rtsp_media_seek().
+ * Seeking can be done with gst_rtsp_media_seek(), or gst_rtsp_media_seek_full()
+ * or gst_rtsp_media_seek_trickmode() for finer control of the seek.
  *
  * With gst_rtsp_media_unprepare() the pipeline is stopped and shut down. When
  * gst_rtsp_media_set_eos_shutdown() an EOS will be sent to the pipeline to
@@ -145,6 +146,7 @@ struct _GstRTSPMediaPrivate
   gboolean do_retransmission;   /* protected by lock */
   guint latency;                /* protected by lock */
   GstClock *clock;              /* protected by lock */
+  gboolean do_rate_control;     /* protected by lock */
   GstRTSPPublishClockMode publish_clock_mode;
 
   /* Dynamic element handling */
@@ -166,6 +168,7 @@ struct _GstRTSPMediaPrivate
 #define DEFAULT_STOP_ON_DISCONNECT TRUE
 #define DEFAULT_MAX_MCAST_TTL   255
 #define DEFAULT_BIND_MCAST_ADDRESS FALSE
+#define DEFAULT_DO_RATE_CONTROL TRUE
 
 #define DEFAULT_DO_RETRANSMISSION FALSE
 
@@ -470,6 +473,7 @@ gst_rtsp_media_init (GstRTSPMedia * media)
   priv->do_retransmission = DEFAULT_DO_RETRANSMISSION;
   priv->max_mcast_ttl = DEFAULT_MAX_MCAST_TTL;
   priv->bind_mcast_address = DEFAULT_BIND_MCAST_ADDRESS;
+  priv->do_rate_control = DEFAULT_DO_RATE_CONTROL;
 }
 
 static void
@@ -731,25 +735,6 @@ default_create_rtpbin (GstRTSPMedia * media)
   return rtpbin;
 }
 
-static gboolean
-is_receive_only (GstRTSPMedia * media)
-{
-  GstRTSPMediaPrivate *priv = media->priv;
-  gboolean recive_only = TRUE;
-  guint i;
-
-  for (i = 0; i < priv->streams->len; i++) {
-    GstRTSPStream *stream = g_ptr_array_index (priv->streams, i);
-    if (gst_rtsp_stream_is_sender (stream) ||
-        !gst_rtsp_stream_is_receiver (stream)) {
-      recive_only = FALSE;
-      break;
-    }
-  }
-
-  return recive_only;
-}
-
 /* must be called with state lock */
 static void
 check_seekable (GstRTSPMedia * media)
@@ -758,7 +743,7 @@ check_seekable (GstRTSPMedia * media)
   GstRTSPMediaPrivate *priv = media->priv;
 
   /* Update the seekable state of the pipeline in case it changed */
-  if (is_receive_only (media)) {
+  if (gst_rtsp_media_is_receive_only (media)) {
     /* TODO: Seeking for "receive-only"? */
     priv->seekable = -1;
   } else {
@@ -1869,6 +1854,8 @@ gst_rtsp_media_get_multicast_iface (GstRTSPMedia * media)
  * Set the maximum time-to-live value of outgoing multicast packets.
  *
  * Returns: %TRUE if the requested ttl has been set successfully.
+ *
+ * Since: 1.16
  */
 gboolean
 gst_rtsp_media_set_max_mcast_ttl (GstRTSPMedia * media, guint ttl)
@@ -1907,6 +1894,8 @@ gst_rtsp_media_set_max_mcast_ttl (GstRTSPMedia * media, guint ttl)
  * Get the the maximum time-to-live value of outgoing multicast packets.
  *
  * Returns: the maximum time-to-live value of outgoing multicast packets.
+ *
+ * Since: 1.16
  */
 guint
 gst_rtsp_media_get_max_mcast_ttl (GstRTSPMedia * media)
@@ -1932,6 +1921,8 @@ gst_rtsp_media_get_max_mcast_ttl (GstRTSPMedia * media)
  *
  * Decide whether the multicast socket should be bound to a multicast address or
  * INADDR_ANY.
+ *
+ * Since: 1.16
  */
 void
 gst_rtsp_media_set_bind_mcast_address (GstRTSPMedia * media,
@@ -1960,6 +1951,8 @@ gst_rtsp_media_set_bind_mcast_address (GstRTSPMedia * media,
  * Check if multicast sockets are configured to be bound to multicast addresses.
  *
  * Returns: %TRUE if multicast sockets are configured to be bound to multicast addresses.
+ *
+ * Since: 1.16
  */
 gboolean
 gst_rtsp_media_is_bind_mcast_address (GstRTSPMedia * media)
@@ -2303,6 +2296,7 @@ gst_rtsp_media_create_stream (GstRTSPMedia * media, GstElement * payloader,
   gst_rtsp_stream_set_retransmission_time (stream, priv->rtx_time);
   gst_rtsp_stream_set_buffer_size (stream, priv->buffer_size);
   gst_rtsp_stream_set_publish_clock_mode (stream, priv->publish_clock_mode);
+  gst_rtsp_stream_set_rate_control (stream, priv->do_rate_control);
 
   g_ptr_array_add (priv->streams, stream);
 
@@ -2546,6 +2540,51 @@ conversion_failed:
   }
 }
 
+/**
+ * gst_rtsp_media_get_rates:
+ * @media: a #GstRTSPMedia
+ * @rate (allow-none): the rate of the current segment
+ * @applied_rate (allow-none): the applied_rate of the current segment
+ *
+ * Get the rate and applied_rate of the current segment.
+ *
+ * Returns: %FALSE if looking up the rate and applied rate failed. Otherwise
+ * %TRUE is returned and @rate and @applied_rate are set to the rate and
+ * applied_rate of the current segment.
+ * Since: 1.18
+ */
+gboolean
+gst_rtsp_media_get_rates (GstRTSPMedia * media, gdouble * rate,
+    gdouble * applied_rate)
+{
+  GstRTSPMediaPrivate *priv;
+  GstRTSPStream *stream;
+  gboolean result = TRUE;
+
+  g_return_val_if_fail (GST_IS_RTSP_MEDIA (media), FALSE);
+
+  if (!rate && !applied_rate) {
+    GST_WARNING_OBJECT (media, "rate and applied_rate are both NULL");
+    return FALSE;
+  }
+
+  priv = media->priv;
+
+  g_mutex_lock (&priv->lock);
+
+  g_assert (priv->streams->len > 0);
+  stream = g_ptr_array_index (priv->streams, 0);
+  if (!gst_rtsp_stream_get_rates (stream, rate, applied_rate)) {
+    GST_WARNING_OBJECT (media,
+        "failed to obtain rate and applied_rate from first stream");
+    result = FALSE;
+  }
+
+  g_mutex_unlock (&priv->lock);
+
+  return result;
+}
+
 static void
 stream_update_blocked (GstRTSPStream * stream, GstRTSPMedia * media)
 {
@@ -2627,20 +2666,27 @@ gst_rtsp_media_get_status (GstRTSPMedia * media)
 }
 
 /**
- * gst_rtsp_media_seek_full:
+ * gst_rtsp_media_seek_trickmode:
  * @media: a #GstRTSPMedia
  * @range: (transfer none): a #GstRTSPTimeRange
  * @flags: The minimal set of #GstSeekFlags to use
+ * @rate: the rate to use in the seek
+ * @trickmode_interval: The trickmode interval to use for KEY_UNITS trick mode
  *
- * Seek the pipeline of @media to @range. @media must be prepared with
- * gst_rtsp_media_prepare(). In order to perform the seek operation,
- * the pipeline must contain all needed transport parts (transport sinks).
+ * Seek the pipeline of @media to @range with the given @flags and @rate,
+ * and @trickmode_interval.
+ * @media must be prepared with gst_rtsp_media_prepare().
+ * In order to perform the seek operation, the pipeline must contain all
+ * needed transport parts (transport sinks).
  *
  * Returns: %TRUE on success.
+ *
+ * Since: 1.18
  */
 gboolean
-gst_rtsp_media_seek_full (GstRTSPMedia * media, GstRTSPTimeRange * range,
-    GstSeekFlags flags)
+gst_rtsp_media_seek_trickmode (GstRTSPMedia * media,
+    GstRTSPTimeRange * range, GstSeekFlags flags, gdouble rate,
+    GstClockTime trickmode_interval)
 {
   GstRTSPMediaClass *klass;
   GstRTSPMediaPrivate *priv;
@@ -2648,12 +2694,15 @@ gst_rtsp_media_seek_full (GstRTSPMedia * media, GstRTSPTimeRange * range,
   GstClockTime start, stop;
   GstSeekType start_type, stop_type;
   gint64 current_position;
+  gboolean force_seek;
 
   klass = GST_RTSP_MEDIA_GET_CLASS (media);
 
   g_return_val_if_fail (GST_IS_RTSP_MEDIA (media), FALSE);
-  g_return_val_if_fail (range != NULL, FALSE);
-  g_return_val_if_fail (klass->convert_range != NULL, FALSE);
+  /* if there's a range then klass->convert_range must be set */
+  g_return_val_if_fail (range == NULL || klass->convert_range != NULL, FALSE);
+
+  GST_DEBUG ("flags=%x  rate=%f", flags, rate);
 
   priv = media->priv;
 
@@ -2679,15 +2728,21 @@ gst_rtsp_media_seek_full (GstRTSPMedia * media, GstRTSPTimeRange * range,
   }
 
   start_type = stop_type = GST_SEEK_TYPE_NONE;
+  start = stop = GST_CLOCK_TIME_NONE;
 
-  if (!klass->convert_range (media, range, GST_RTSP_RANGE_NPT))
-    goto not_supported;
-  gst_rtsp_range_get_times (range, &start, &stop);
+  /* if caller provided a range convert it to NPT format
+   * if no range provided the seek is assumed to be the same position but with
+   * e.g. the rate changed */
+  if (range != NULL) {
+    if (!klass->convert_range (media, range, GST_RTSP_RANGE_NPT))
+      goto not_supported;
+    gst_rtsp_range_get_times (range, &start, &stop);
 
-  GST_INFO ("got %" GST_TIME_FORMAT " - %" GST_TIME_FORMAT,
-      GST_TIME_ARGS (start), GST_TIME_ARGS (stop));
-  GST_INFO ("current %" GST_TIME_FORMAT " - %" GST_TIME_FORMAT,
-      GST_TIME_ARGS (priv->range_start), GST_TIME_ARGS (priv->range_stop));
+    GST_INFO ("got %" GST_TIME_FORMAT " - %" GST_TIME_FORMAT,
+        GST_TIME_ARGS (start), GST_TIME_ARGS (stop));
+    GST_INFO ("current %" GST_TIME_FORMAT " - %" GST_TIME_FORMAT,
+        GST_TIME_ARGS (priv->range_start), GST_TIME_ARGS (priv->range_stop));
+  }
 
   current_position = -1;
   if (klass->query_position)
@@ -2698,29 +2753,27 @@ gst_rtsp_media_seek_full (GstRTSPMedia * media, GstRTSPTimeRange * range,
   if (start != GST_CLOCK_TIME_NONE)
     start_type = GST_SEEK_TYPE_SET;
 
-  if (priv->range_stop == stop)
-    stop = GST_CLOCK_TIME_NONE;
-  else if (stop != GST_CLOCK_TIME_NONE)
+  if (stop != GST_CLOCK_TIME_NONE)
     stop_type = GST_SEEK_TYPE_SET;
 
-  if (start != GST_CLOCK_TIME_NONE || stop != GST_CLOCK_TIME_NONE) {
-    gboolean had_flags = flags != 0;
+  /* we force a seek if any seek flag is set, or if the the rate
+   * is non-standard, i.e. not 1.0 */
+  force_seek = flags != GST_SEEK_FLAG_NONE || rate != 1.0;
+
+  if (start != GST_CLOCK_TIME_NONE || stop != GST_CLOCK_TIME_NONE || force_seek) {
+    gboolean had_flags = flags != GST_SEEK_FLAG_NONE;
 
     GST_INFO ("seeking to %" GST_TIME_FORMAT " - %" GST_TIME_FORMAT,
         GST_TIME_ARGS (start), GST_TIME_ARGS (stop));
 
     /* depends on the current playing state of the pipeline. We might need to
      * queue this until we get EOS. */
-    if (had_flags)
-      flags |= GST_SEEK_FLAG_FLUSH;
-    else
-      flags = GST_SEEK_FLAG_FLUSH;
-
+    flags |= GST_SEEK_FLAG_FLUSH;
 
     /* if range start was not supplied we must continue from current position.
      * but since we're doing a flushing seek, let us query the current position
      * so we end up at exactly the same position after the seek. */
-    if (range->min.type == GST_RTSP_TIME_END) { /* Yepp, that's right! */
+    if (range == NULL || range->min.type == GST_RTSP_TIME_END) {
       if (current_position == -1) {
         GST_WARNING ("current position unknown");
       } else {
@@ -2738,15 +2791,45 @@ gst_rtsp_media_seek_full (GstRTSPMedia * media, GstRTSPTimeRange * range,
           flags |= GST_SEEK_FLAG_KEY_UNIT;
     }
 
-    if (start == current_position && stop_type == GST_SEEK_TYPE_NONE) {
-      GST_DEBUG ("not seeking because no position change");
+    if (start == current_position && stop_type == GST_SEEK_TYPE_NONE &&
+        !force_seek) {
+      GST_DEBUG ("no position change, no flags set by caller, so not seeking");
       res = TRUE;
     } else {
+      GstEvent *seek_event;
+      gboolean unblock = FALSE;
+
       gst_rtsp_media_set_status (media, GST_RTSP_MEDIA_STATUS_PREPARING);
 
-      /* FIXME, we only do forwards playback, no trick modes yet */
-      res = gst_element_seek (priv->pipeline, 1.0, GST_FORMAT_TIME,
-          flags, start_type, start, stop_type, stop);
+      if (rate < 0.0) {
+        GstClockTime temp_time = start;
+        GstSeekType temp_type = start_type;
+
+        start = stop;
+        start_type = stop_type;
+        stop = temp_time;
+        stop_type = temp_type;
+      }
+
+      seek_event = gst_event_new_seek (rate, GST_FORMAT_TIME, flags, start_type,
+          start, stop_type, stop);
+
+      gst_event_set_seek_trickmode_interval (seek_event, trickmode_interval);
+
+      if (!media->priv->blocked) {
+        /* Prevent a race condition with multiple streams,
+         * where one stream may have time to preroll before others
+         * have even started flushing, causing async-done to be
+         * posted too early.
+         */
+        media_streams_set_blocked (media, TRUE);
+        unblock = TRUE;
+      }
+
+      res = gst_element_send_event (priv->pipeline, seek_event);
+
+      if (unblock)
+        media_streams_set_blocked (media, FALSE);
 
       /* and block for the seek to complete */
       GST_INFO ("done seeking %d", res);
@@ -2809,6 +2892,23 @@ preroll_failed:
   }
 }
 
+/**
+ * gst_rtsp_media_seek_full:
+ * @media: a #GstRTSPMedia
+ * @range: (transfer none): a #GstRTSPTimeRange
+ * @flags: The minimal set of #GstSeekFlags to use
+ *
+ * Seek the pipeline of @media to @range with the given @flags.
+ * @media must be prepared with gst_rtsp_media_prepare().
+ *
+ * Returns: %TRUE on success.
+ */
+gboolean
+gst_rtsp_media_seek_full (GstRTSPMedia * media, GstRTSPTimeRange * range,
+    GstSeekFlags flags)
+{
+  return gst_rtsp_media_seek_trickmode (media, range, flags, 1.0, 0);
+}
 
 /**
  * gst_rtsp_media_seek:
@@ -2823,9 +2923,9 @@ preroll_failed:
 gboolean
 gst_rtsp_media_seek (GstRTSPMedia * media, GstRTSPTimeRange * range)
 {
-  return gst_rtsp_media_seek_full (media, range, 0);
+  return gst_rtsp_media_seek_trickmode (media, range, GST_SEEK_FLAG_NONE,
+      1.0, 0);
 }
-
 
 static void
 stream_collect_blocking (GstRTSPStream * stream, gboolean * blocked)
@@ -2900,8 +3000,9 @@ default_handle_message (GstRTSPMedia * media, GstMessage * message)
       GST_DEBUG ("%p: went from %s to %s (pending %s)", media,
           gst_element_state_get_name (old), gst_element_state_get_name (new),
           gst_element_state_get_name (pending));
-      if (priv->no_more_pads_pending == 0 && is_receive_only (media) &&
-          old == GST_STATE_READY && new == GST_STATE_PAUSED) {
+      if (priv->no_more_pads_pending == 0
+          && gst_rtsp_media_is_receive_only (media) && old == GST_STATE_READY
+          && new == GST_STATE_PAUSED) {
         GST_INFO ("%p: went to PAUSED, prepared now", media);
         collect_media_stats (media);
 
@@ -3375,7 +3476,7 @@ start_prepare (GstRTSPMedia * media)
     g_object_set_data (G_OBJECT (elem), "gst-rtsp-dynpay-handlers", handlers);
   }
 
-  if (priv->nb_dynamic_elements == 0 && is_receive_only (media)) {
+  if (priv->nb_dynamic_elements == 0 && gst_rtsp_media_is_receive_only (media)) {
     /* If we are receive_only (RECORD), do not try to preroll, to avoid
      * a second ASYNC state change failing */
     priv->is_live = TRUE;
@@ -4202,7 +4303,7 @@ default_unsuspend (GstRTSPMedia * media)
 
   switch (priv->suspend_mode) {
     case GST_RTSP_SUSPEND_MODE_NONE:
-      if (is_receive_only (media))
+      if (gst_rtsp_media_is_receive_only (media))
         break;
       if (media_streams_blocking (media)) {
         gst_rtsp_media_set_status (media, GST_RTSP_MEDIA_STATUS_PREPARING);
@@ -4546,7 +4647,7 @@ gst_rtsp_media_get_transport_mode (GstRTSPMedia * media)
 }
 
 /**
- * gst_rtsp_media_get_seekable:
+ * gst_rtsp_media_seekable:
  * @media: a #GstRTSPMedia
  *
  * Check if the pipeline for @media seek and up to what point in time,
@@ -4555,6 +4656,8 @@ gst_rtsp_media_get_transport_mode (GstRTSPMedia * media)
  * Returns: -1 if the stream is not seekable, 0 if seekable only to the beginning
  * and > 0 to indicate the longest duration between any two random access points.
  * %G_MAXINT64 means any value is possible.
+ *
+ * Since: 1.14
  */
 GstClockTimeDiff
 gst_rtsp_media_seekable (GstRTSPMedia * media)
@@ -4584,6 +4687,8 @@ gst_rtsp_media_seekable (GstRTSPMedia * media)
  * SETUP.
  *
  * Returns: %TRUE if the media pipeline has been sucessfully updated.
+ *
+ * Since: 1.14
  */
 gboolean
 gst_rtsp_media_complete_pipeline (GstRTSPMedia * media, GPtrArray * transports)
@@ -4624,4 +4729,85 @@ gst_rtsp_media_complete_pipeline (GstRTSPMedia * media, GPtrArray * transports)
   g_mutex_unlock (&priv->lock);
 
   return TRUE;
+}
+
+/**
+ * gst_rtsp_media_is_receive_only:
+ *
+ * Returns: %TRUE if @media is receive-only, %FALSE otherwise.
+ * Since: 1.18
+ */
+gboolean
+gst_rtsp_media_is_receive_only (GstRTSPMedia * media)
+{
+  GstRTSPMediaPrivate *priv = media->priv;
+  gboolean receive_only = TRUE;
+  guint i;
+
+  for (i = 0; i < priv->streams->len; i++) {
+    GstRTSPStream *stream = g_ptr_array_index (priv->streams, i);
+    if (gst_rtsp_stream_is_sender (stream) ||
+        !gst_rtsp_stream_is_receiver (stream)) {
+      receive_only = FALSE;
+      break;
+    }
+  }
+
+  return receive_only;
+}
+
+/**
+ * gst_rtsp_media_set_rate_control:
+ *
+ * Define whether @media will follow the Rate-Control=no behaviour as specified
+ * in the ONVIF replay spec.
+ *
+ * Since: 1.18
+ */
+void
+gst_rtsp_media_set_rate_control (GstRTSPMedia * media, gboolean enabled)
+{
+  GstRTSPMediaPrivate *priv;
+  guint i;
+
+  g_return_if_fail (GST_IS_RTSP_MEDIA (media));
+
+  GST_LOG_OBJECT (media, "%s rate control", enabled ? "Enabling" : "Disabling");
+
+  priv = media->priv;
+
+  g_mutex_lock (&priv->lock);
+  priv->do_rate_control = enabled;
+  for (i = 0; i < priv->streams->len; i++) {
+    GstRTSPStream *stream = g_ptr_array_index (priv->streams, i);
+
+    gst_rtsp_stream_set_rate_control (stream, enabled);
+
+  }
+  g_mutex_unlock (&priv->lock);
+}
+
+/**
+ * gst_rtsp_media_get_rate_control:
+ *
+ * Returns: whether @media will follow the Rate-Control=no behaviour as specified
+ * in the ONVIF replay spec.
+ *
+ * Since: 1.18
+ */
+gboolean
+gst_rtsp_media_get_rate_control (GstRTSPMedia * media)
+{
+  GstRTSPMediaPrivate *priv;
+  gboolean res;
+
+  g_return_val_if_fail (GST_IS_RTSP_MEDIA (media), FALSE);
+
+  priv = media->priv;
+
+  g_mutex_lock (&priv->lock);
+  res = priv->do_rate_control;
+  g_mutex_unlock (&priv->lock);
+
+  return res;
 }

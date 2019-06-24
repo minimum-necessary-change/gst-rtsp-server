@@ -103,6 +103,8 @@ struct _GstRTSPClientPrivate
 
   gboolean drop_backlog;
 
+  guint content_length_limit;
+
   guint rtsp_ctrl_timeout_id;
   guint rtsp_ctrl_timeout_cnt;
 
@@ -609,6 +611,7 @@ gst_rtsp_client_init (GstRTSPClient * client)
   priv->pipelined_requests = g_hash_table_new_full (g_str_hash,
       g_str_equal, g_free, g_free);
   priv->tstate = TUNNEL_STATE_UNKNOWN;
+  priv->content_length_limit = G_MAXUINT;
 }
 
 static GstRTSPFilterResult
@@ -1727,6 +1730,200 @@ make_base_url (GstRTSPClient * client, GstRTSPUrl * url, const gchar * path)
   return result;
 }
 
+/* Check if the given header of type double is present and, if so,
+ * put it's value in the supplied variable.
+ */
+static GstRTSPStatusCode
+parse_header_value_double (GstRTSPClient * client, GstRTSPContext * ctx,
+    GstRTSPHeaderField header, gboolean * present, gdouble * value)
+{
+  GstRTSPResult res;
+  gchar *str;
+  gchar *end;
+
+  res = gst_rtsp_message_get_header (ctx->request, header, &str, 0);
+  if (res == GST_RTSP_OK) {
+    *value = g_ascii_strtod (str, &end);
+    if (end == str)
+      goto parse_header_failed;
+
+    GST_DEBUG ("client %p: got '%s', value %f", client,
+        gst_rtsp_header_as_text (header), *value);
+    *present = TRUE;
+  } else {
+    *present = FALSE;
+  }
+
+  return GST_RTSP_STS_OK;
+
+parse_header_failed:
+  {
+    GST_ERROR ("client %p: failed parsing '%s' header", client,
+        gst_rtsp_header_as_text (header));
+    return GST_RTSP_STS_BAD_REQUEST;
+  }
+}
+
+/* Parse scale and speed headers, if present, and set the rate to
+ * (rate * scale * speed) */
+static GstRTSPStatusCode
+parse_scale_and_speed (GstRTSPClient * client, GstRTSPContext * ctx,
+    gboolean * scale_present, gboolean * speed_present, gdouble * rate,
+    GstSeekFlags * flags)
+{
+  gdouble scale = 1.0;
+  gdouble speed = 1.0;
+  GstRTSPStatusCode status;
+
+  GST_DEBUG ("got rate %f", *rate);
+
+  status = parse_header_value_double (client, ctx, GST_RTSP_HDR_SCALE,
+      scale_present, &scale);
+  if (status != GST_RTSP_STS_OK)
+    return status;
+
+  if (*scale_present) {
+    GST_DEBUG ("got Scale %f", scale);
+    if (scale == 0)
+      goto bad_scale_value;
+    *rate *= scale;
+
+    if (ABS (scale) != 1.0)
+      *flags |= GST_SEEK_FLAG_TRICKMODE;
+  }
+
+  GST_DEBUG ("rate after parsing Scale %f", *rate);
+
+  status = parse_header_value_double (client, ctx, GST_RTSP_HDR_SPEED,
+      speed_present, &speed);
+  if (status != GST_RTSP_STS_OK)
+    return status;
+
+  if (*speed_present) {
+    GST_DEBUG ("got Speed %f", speed);
+    if (speed <= 0)
+      goto bad_speed_value;
+    *rate *= speed;
+  }
+
+  GST_DEBUG ("rate after parsing Speed %f", *rate);
+
+  return status;
+
+bad_scale_value:
+  {
+    GST_ERROR ("client %p: bad 'Scale' header value (%f)", client, scale);
+    return GST_RTSP_STS_BAD_REQUEST;
+  }
+bad_speed_value:
+  {
+    GST_ERROR ("client %p: bad 'Speed' header value (%f)", client, speed);
+    return GST_RTSP_STS_BAD_REQUEST;
+  }
+}
+
+static GstRTSPStatusCode
+setup_play_mode (GstRTSPClient * client, GstRTSPContext * ctx,
+    GstRTSPRangeUnit * unit, gboolean * scale_present, gboolean * speed_present)
+{
+  gchar *str;
+  GstRTSPResult res;
+  GstRTSPTimeRange *range = NULL;
+  gdouble rate = 1.0;
+  GstSeekFlags flags = GST_SEEK_FLAG_NONE;
+  GstRTSPClientClass *klass = GST_RTSP_CLIENT_GET_CLASS (client);
+  GstRTSPStatusCode rtsp_status_code;
+  GstClockTime trickmode_interval = 0;
+  gboolean enable_rate_control = TRUE;
+
+  /* parse the range header if we have one */
+  res = gst_rtsp_message_get_header (ctx->request, GST_RTSP_HDR_RANGE, &str, 0);
+  if (res == GST_RTSP_OK) {
+    gchar *seek_style = NULL;
+
+    res = gst_rtsp_range_parse (str, &range);
+    if (res != GST_RTSP_OK)
+      goto parse_range_failed;
+
+    *unit = range->unit;
+
+    /* parse seek style header, if present */
+    res = gst_rtsp_message_get_header (ctx->request, GST_RTSP_HDR_SEEK_STYLE,
+        &seek_style, 0);
+
+    if (res == GST_RTSP_OK) {
+      if (g_strcmp0 (seek_style, "RAP") == 0)
+        flags = GST_SEEK_FLAG_ACCURATE;
+      else if (g_strcmp0 (seek_style, "CoRAP") == 0)
+        flags = GST_SEEK_FLAG_KEY_UNIT;
+      else if (g_strcmp0 (seek_style, "First-Prior") == 0)
+        flags = GST_SEEK_FLAG_KEY_UNIT & GST_SEEK_FLAG_SNAP_BEFORE;
+      else if (g_strcmp0 (seek_style, "Next") == 0)
+        flags = GST_SEEK_FLAG_KEY_UNIT & GST_SEEK_FLAG_SNAP_AFTER;
+      else
+        GST_FIXME_OBJECT (client, "Add support for seek style %s", seek_style);
+    }
+  }
+
+  /* check for scale and/or speed headers
+   * we will set the seek rate to (speed * scale) and let the media decide
+   * the resulting scale and speed. in the response we will use rate and applied
+   * rate from the resulting segment as values for the speed and scale headers
+   * respectively */
+  rtsp_status_code = parse_scale_and_speed (client, ctx, scale_present,
+      speed_present, &rate, &flags);
+  if (rtsp_status_code != GST_RTSP_STS_OK)
+    goto scale_speed_failed;
+
+  /* give the application a chance to tweak range, flags, or rate */
+  if (klass->adjust_play_mode != NULL) {
+    rtsp_status_code =
+        klass->adjust_play_mode (client, ctx, &range, &flags, &rate,
+        &trickmode_interval, &enable_rate_control);
+    if (rtsp_status_code != GST_RTSP_STS_OK)
+      goto adjust_play_mode_failed;
+  }
+
+  gst_rtsp_media_set_rate_control (ctx->media, enable_rate_control);
+
+  /* now do the seek with the seek options */
+  gst_rtsp_media_seek_trickmode (ctx->media, range, flags, rate,
+      trickmode_interval);
+  if (range != NULL)
+    gst_rtsp_range_free (range);
+
+  if (gst_rtsp_media_get_status (ctx->media) == GST_RTSP_MEDIA_STATUS_ERROR)
+    goto seek_failed;
+
+  return GST_RTSP_STS_OK;
+
+parse_range_failed:
+  {
+    GST_ERROR ("client %p: failed parsing range header", client);
+    return GST_RTSP_STS_BAD_REQUEST;
+  }
+scale_speed_failed:
+  {
+    if (range != NULL)
+      gst_rtsp_range_free (range);
+    GST_ERROR ("client %p: failed parsing Scale or Speed headers", client);
+    return rtsp_status_code;
+  }
+adjust_play_mode_failed:
+  {
+    GST_ERROR ("client %p: sub class returned bad code (%d)", client,
+        rtsp_status_code);
+    if (range != NULL)
+      gst_rtsp_range_free (range);
+    return rtsp_status_code;
+  }
+seek_failed:
+  {
+    GST_ERROR ("client %p: seek failed", client);
+    return GST_RTSP_STS_SERVICE_UNAVAILABLE;
+  }
+}
+
 static gboolean
 handle_play_request (GstRTSPClient * client, GstRTSPContext * ctx)
 {
@@ -1737,8 +1934,6 @@ handle_play_request (GstRTSPClient * client, GstRTSPContext * ctx)
   GstRTSPStatusCode code;
   GstRTSPUrl *uri;
   gchar *str;
-  GstRTSPTimeRange *range;
-  GstRTSPResult res;
   GstRTSPState rtspstate;
   GstRTSPRangeUnit unit = GST_RTSP_RANGE_NPT;
   gchar *path, *rtpinfo;
@@ -1746,6 +1941,10 @@ handle_play_request (GstRTSPClient * client, GstRTSPContext * ctx)
   gchar *seek_style = NULL;
   GstRTSPStatusCode sig_result;
   GPtrArray *transports;
+  gboolean scale_present;
+  gboolean speed_present;
+  gdouble rate;
+  gdouble applied_rate;
 
   if (!(session = ctx->session))
     goto no_session;
@@ -1796,38 +1995,9 @@ handle_play_request (GstRTSPClient * client, GstRTSPContext * ctx)
   if (!gst_rtsp_media_unsuspend (media))
     goto unsuspend_failed;
 
-  /* parse the range header if we have one */
-  res = gst_rtsp_message_get_header (ctx->request, GST_RTSP_HDR_RANGE, &str, 0);
-  if (res == GST_RTSP_OK) {
-    if (gst_rtsp_range_parse (str, &range) == GST_RTSP_OK) {
-      GstRTSPMediaStatus media_status;
-      GstSeekFlags flags = 0;
-
-      if (gst_rtsp_message_get_header (ctx->request, GST_RTSP_HDR_SEEK_STYLE,
-              &seek_style, 0)) {
-        if (g_strcmp0 (seek_style, "RAP") == 0)
-          flags = GST_SEEK_FLAG_ACCURATE;
-        else if (g_strcmp0 (seek_style, "CoRAP") == 0)
-          flags = GST_SEEK_FLAG_KEY_UNIT;
-        else if (g_strcmp0 (seek_style, "First-Prior") == 0)
-          flags = GST_SEEK_FLAG_KEY_UNIT & GST_SEEK_FLAG_SNAP_BEFORE;
-        else if (g_strcmp0 (seek_style, "Next") == 0)
-          flags = GST_SEEK_FLAG_KEY_UNIT & GST_SEEK_FLAG_SNAP_AFTER;
-        else
-          GST_FIXME_OBJECT (client, "Add support for seek style %s",
-              seek_style);
-      }
-
-      /* we have a range, seek to the position */
-      unit = range->unit;
-      gst_rtsp_media_seek_full (media, range, flags);
-      gst_rtsp_range_free (range);
-
-      media_status = gst_rtsp_media_get_status (media);
-      if (media_status == GST_RTSP_MEDIA_STATUS_ERROR)
-        goto seek_failed;
-    }
-  }
+  code = setup_play_mode (client, ctx, &unit, &scale_present, &speed_present);
+  if (code != GST_RTSP_STS_OK)
+    goto invalid_mode;
 
   /* grab RTPInfo from the media now */
   rtpinfo = gst_rtsp_session_media_get_rtpinfo (sessmedia);
@@ -1849,6 +2019,29 @@ handle_play_request (GstRTSPClient * client, GstRTSPContext * ctx)
   str = gst_rtsp_media_get_range_string (media, TRUE, unit);
   if (str)
     gst_rtsp_message_take_header (ctx->response, GST_RTSP_HDR_RANGE, str);
+
+  if (!gst_rtsp_media_is_receive_only (media)) {
+    /* the scale and speed headers must always be added if they were present in
+     * the request. however, even if they were not, we still add them if
+     * applied_rate or rate deviate from the "normal", i.e. 1.0 */
+    if (!gst_rtsp_media_get_rates (media, &rate, &applied_rate))
+      goto get_rates_error;
+    g_assert (rate != 0 && applied_rate != 0);
+
+    if (scale_present || applied_rate != 1.0)
+      gst_rtsp_message_take_header (ctx->response, GST_RTSP_HDR_SCALE,
+          g_strdup_printf ("%1.3f", applied_rate));
+
+    if (speed_present || rate != 1.0)
+      gst_rtsp_message_take_header (ctx->response, GST_RTSP_HDR_SPEED,
+          g_strdup_printf ("%1.3f", rate));
+  }
+
+  if (klass->adjust_play_response) {
+    code = klass->adjust_play_response (client, ctx);
+    if (code != GST_RTSP_STS_OK)
+      goto adjust_play_response_failed;
+  }
 
   send_message (client, ctx, ctx->response, FALSE);
 
@@ -1915,16 +2108,28 @@ unsuspend_failed:
     send_generic_response (client, GST_RTSP_STS_SERVICE_UNAVAILABLE, ctx);
     return FALSE;
   }
-seek_failed:
+invalid_mode:
   {
     GST_ERROR ("client %p: seek failed", client);
-    send_generic_response (client, GST_RTSP_STS_SERVICE_UNAVAILABLE, ctx);
+    send_generic_response (client, code, ctx);
     return FALSE;
   }
 unsupported_mode:
   {
     GST_ERROR ("client %p: media does not support PLAY", client);
     send_generic_response (client, GST_RTSP_STS_METHOD_NOT_ALLOWED, ctx);
+    return FALSE;
+  }
+get_rates_error:
+  {
+    GST_ERROR ("client %p: failed obtaining rate and applied_rate", client);
+    send_generic_response (client, GST_RTSP_STS_INTERNAL_SERVER_ERROR, ctx);
+    return FALSE;
+  }
+adjust_play_response_failed:
+  {
+    GST_ERROR ("client %p: failed to adjust play response", client);
+    send_generic_response (client, code, ctx);
     return FALSE;
   }
 }
@@ -3984,6 +4189,57 @@ gst_rtsp_client_get_mount_points (GstRTSPClient * client)
 }
 
 /**
+ * gst_rtsp_client_set_content_length_limit:
+ * @client: a #GstRTSPClient
+ * @limit: Content-Length limit
+ *
+ * Configure @client to use the specified Content-Length limit.
+ *
+ * Define an appropriate request size limit and reject requests exceeding the
+ * limit with response status 413 Request Entity Too Large
+ *
+ * Since: 1.18
+ */
+void
+gst_rtsp_client_set_content_length_limit (GstRTSPClient * client, guint limit)
+{
+  GstRTSPClientPrivate *priv;
+
+  g_return_if_fail (GST_IS_RTSP_CLIENT (client));
+
+  priv = client->priv;
+  g_mutex_lock (&priv->lock);
+  priv->content_length_limit = limit;
+  g_mutex_unlock (&priv->lock);
+}
+
+/**
+ * gst_rtsp_client_get_content_length_limit:
+ * @client: a #GstRTSPClient
+ *
+ * Get the Content-Length limit of @client.
+ *
+ * Returns: the Content-Length limit.
+ *
+ * Since: 1.18
+ */
+guint
+gst_rtsp_client_get_content_length_limit (GstRTSPClient * client)
+{
+  GstRTSPClientPrivate *priv;
+  glong content_length_limit;
+
+  g_return_val_if_fail (GST_IS_RTSP_CLIENT (client), -1);
+  priv = client->priv;
+
+  g_mutex_lock (&priv->lock);
+  content_length_limit = priv->content_length_limit;
+  g_mutex_unlock (&priv->lock);
+
+  return content_length_limit;
+}
+
+/**
  * gst_rtsp_client_set_auth:
  * @client: a #GstRTSPClient
  * @auth: (transfer none) (nullable): a #GstRTSPAuth
@@ -4122,6 +4378,8 @@ gst_rtsp_client_set_connection (GstRTSPClient * client,
 
   priv = client->priv;
 
+  gst_rtsp_connection_set_content_length_limit (conn,
+      priv->content_length_limit);
   read_socket = gst_rtsp_connection_get_read_socket (conn);
 
   if (!(address = g_socket_get_local_address (read_socket, &error)))
@@ -4341,6 +4599,26 @@ gst_rtsp_client_send_message (GstRTSPClient * client, GstRTSPSession * session,
   return GST_RTSP_OK;
 }
 
+/**
+ * gst_rtsp_client_get_stream_transport:
+ *
+ * This is useful when providing a send function through
+ * gst_rtsp_client_set_send_func() when doing RTSP over TCP:
+ * the send function must call gst_rtsp_stream_transport_message_sent ()
+ * on the appropriate transport when data has been received for streaming
+ * to continue.
+ *
+ * Returns: (transfer none) (nullable): the #GstRTSPStreamTransport associated with @channel.
+ *
+ * Since: 1.18
+ */
+GstRTSPStreamTransport *
+gst_rtsp_client_get_stream_transport (GstRTSPClient * self, guint8 channel)
+{
+  return g_hash_table_lookup (self->priv->transports,
+      GINT_TO_POINTER ((gint) channel));
+}
+
 static gboolean
 do_send_messages (GstRTSPClient * client, GstRTSPMessage * messages,
     guint n_messages, gboolean close, gpointer user_data)
@@ -4492,7 +4770,39 @@ error_full (GstRTSPWatch * watch, GstRTSPResult result,
 {
   GstRTSPClient *client = GST_RTSP_CLIENT (user_data);
   gchar *str;
+  GstRTSPContext sctx = { NULL }, *ctx;
+  GstRTSPClientPrivate *priv;
+  GstRTSPMessage response = { 0 };
+  priv = client->priv;
 
+  if (!(ctx = gst_rtsp_context_get_current ())) {
+    ctx = &sctx;
+    ctx->auth = priv->auth;
+    gst_rtsp_context_push_current (ctx);
+  }
+
+  ctx->conn = priv->connection;
+  ctx->client = client;
+  ctx->request = message;
+  ctx->method = GST_RTSP_INVALID;
+  ctx->response = &response;
+
+  /* only return error response if it is a request */
+  if (!message || message->type != GST_RTSP_MESSAGE_REQUEST)
+    goto done;
+
+  if (result == GST_RTSP_ENOMEM) {
+    send_generic_response (client, GST_RTSP_STS_REQUEST_ENTITY_TOO_LARGE, ctx);
+    goto done;
+  }
+  if (result == GST_RTSP_EPARSE) {
+    send_generic_response (client, GST_RTSP_STS_BAD_REQUEST, ctx);
+    goto done;
+  }
+
+done:
+  if (ctx == &sctx)
+    gst_rtsp_context_pop_current (ctx);
   str = gst_rtsp_strresult (result);
   GST_INFO
       ("client %p: error when handling message %p with id %d: %s",
